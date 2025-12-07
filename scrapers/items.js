@@ -7,8 +7,11 @@ const email = process.env.AGR_EMAIL;
 const password = process.env.AGR_PASSWORD;
 const mongoUri = process.env.MONGO_URI;
 
-const executablePathFromEnv =
-  process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || null;
+// Path de Chromium dentro del contenedor / VPS
+const CHROME_EXECUTABLE_PATH =
+  process.env.CHROME_PATH ||
+  process.env.PUPPETEER_EXECUTABLE_PATH ||
+  "/usr/bin/chromium";
 
 if (!email || !password || !mongoUri) {
   console.error("[ITEMS] Faltan AGR_EMAIL, AGR_PASSWORD o MONGO_URI");
@@ -173,129 +176,152 @@ async function extractAllRewards(page) {
 
 // ================== MAIN ==================
 
+let isItemsRunning = false;
+
 async function runItemsScraper() {
+  if (isItemsRunning) {
+    console.log("[ITEMS] Ya hay una ejecución en curso, se cancela esta.");
+    return;
+  }
+  isItemsRunning = true;
+
   console.log("[ITEMS] Conectando a Mongo...");
   await mongoose.connect(mongoUri);
 
-  const launchOptions = {
-    headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-background-timer-throttling",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-renderer-backgrounding",
-    ],
-    protocolTimeout: 240000,
-  };
+  let browser;
 
-  if (executablePathFromEnv) {
+  try {
+    const launchOptions = {
+      headless: true, // más compatible que "new" en VPS
+      executablePath: CHROME_EXECUTABLE_PATH,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-software-rasterizer",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--no-zygote",
+        "--single-process",
+        "--renderer-process-limit=1",
+      ],
+      protocolTimeout: 240000,
+    };
+
     console.log(
-      `[ITEMS] Lanzando Puppeteer usando executablePath=${executablePathFromEnv}`
+      `[ITEMS] Lanzando Puppeteer usando executablePath=${CHROME_EXECUTABLE_PATH}`
     );
-    launchOptions.executablePath = executablePathFromEnv;
-  } else {
-    console.log("[ITEMS] Lanzando Puppeteer con executablePath por defecto");
-  }
+    console.log("[ITEMS] Lanzando Puppeteer...");
+    browser = await puppeteer.launch(launchOptions);
 
-  console.log("[ITEMS] Lanzando Puppeteer...");
-  const browser = await puppeteer.launch(launchOptions);
-  const page = await browser.newPage();
+    const page = await browser.newPage();
+    page.setDefaultNavigationTimeout(240000);
+    page.setDefaultTimeout(240000);
 
-  page.setDefaultNavigationTimeout(240000);
-  page.setDefaultTimeout(240000);
+    await page.setRequestInterception(true);
+    page.on("request", (request) => {
+      if (request.resourceType() === "image") {
+        request.abort();
+      } else {
+        request.continue();
+      }
+    });
 
-  await page.setRequestInterception(true);
-  page.on("request", (request) => {
-    if (request.resourceType() === "image") {
-      request.abort();
-    } else {
-      request.continue();
-    }
-  });
+    await page.goto("https://adm.agrcloud.com.ar", {
+      waitUntil: "networkidle2",
+      timeout: 240000,
+    });
 
-  await page.goto("https://adm.agrcloud.com.ar", {
-    waitUntil: "networkidle2",
-    timeout: 240000,
-  });
+    await page.type("input#Username.form-control.form-icon-input", email);
+    await page.type("input#Password.form-control.form-icon-input", password);
 
-  await page.type("input#Username.form-control.form-icon-input", email);
-  await page.type("input#Password.form-control.form-icon-input", password);
+    await Promise.all([
+      page.click("button[type='submit']"),
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 240000 }),
+    ]);
 
-  await Promise.all([
-    page.click("button[type='submit']"),
-    page.waitForNavigation({ waitUntil: "networkidle2", timeout: 240000 }),
-  ]);
+    console.log("[ITEMS] Login OK, arrancamos scraping...");
 
-  console.log("[ITEMS] Login OK, arrancamos scraping...");
+    const products = await extractAllProducts(page);
+    const rewards = await extractAllRewards(page);
 
-  const products = await extractAllProducts(page);
-  const rewards = await extractAllRewards(page);
-
-  console.log(
-    `[ITEMS] Productos totales: ${products.length}, recompensas totales: ${rewards.length}`
-  );
-
-  const combinedData = [];
-
-  for (const product of products) {
-    const stockVal = parseInt(product.stock, 10) || 0;
-    let existing = combinedData.find(
-      (item) => item.description === product.description
+    console.log(
+      `[ITEMS] Productos totales: ${products.length}, recompensas totales: ${rewards.length}`
     );
 
-    if (!existing) {
-      const base = {
-        description: product.description,
-        category: product.category,
-        stock_bettica:
-          product.location === "DEPOSITO BETTICA" ? stockVal : 0,
-        stock_grupogen:
-          product.location === "DEPOSITO GRUPO GEN" ? stockVal : 0,
-        stock_monteverde:
-          product.location === "DEPOSITO MONTEVERDE" ? stockVal : 0,
-        stock_tobago1:
-          product.location === "DEPOSITO TOBAGO 1" ? stockVal : 0,
-      };
-      base.stock_global =
-        base.stock_bettica +
-        base.stock_grupogen +
-        base.stock_monteverde +
-        base.stock_tobago1;
+    const combinedData = [];
 
-      const reward =
-        rewards.find((r) => r.description === product.description) || {};
+    for (const product of products) {
+      const stockVal = parseInt(product.stock, 10) || 0;
+      let existing = combinedData.find(
+        (item) => item.description === product.description
+      );
 
-      combinedData.push({ ...base, ...reward });
-    } else {
-      if (product.location === "DEPOSITO BETTICA")
-        existing.stock_bettica += stockVal;
-      if (product.location === "DEPOSITO GRUPO GEN")
-        existing.stock_grupogen += stockVal;
-      if (product.location === "DEPOSITO MONTEVERDE")
-        existing.stock_monteverde += stockVal;
-      if (product.location === "DEPOSITO TOBAGO 1")
-        existing.stock_tobago1 += stockVal;
+      if (!existing) {
+        const base = {
+          description: product.description,
+          category: product.category,
+          stock_bettica:
+            product.location === "DEPOSITO BETTICA" ? stockVal : 0,
+          stock_grupogen:
+            product.location === "DEPOSITO GRUPO GEN" ? stockVal : 0,
+          stock_monteverde:
+            product.location === "DEPOSITO MONTEVERDE" ? stockVal : 0,
+          stock_tobago1:
+            product.location === "DEPOSITO TOBAGO 1" ? stockVal : 0,
+        };
+        base.stock_global =
+          base.stock_bettica +
+          base.stock_grupogen +
+          base.stock_monteverde +
+          base.stock_tobago1;
 
-      existing.stock_global =
-        existing.stock_bettica +
-        existing.stock_grupogen +
-        existing.stock_monteverde +
-        existing.stock_tobago1;
+        const reward =
+          rewards.find((r) => r.description === product.description) || {};
+
+        combinedData.push({ ...base, ...reward });
+      } else {
+        if (product.location === "DEPOSITO BETTICA")
+          existing.stock_bettica += stockVal;
+        if (product.location === "DEPOSITO GRUPO GEN")
+          existing.stock_grupogen += stockVal;
+        if (product.location === "DEPOSITO MONTEVERDE")
+          existing.stock_monteverde += stockVal;
+        if (product.location === "DEPOSITO TOBAGO 1")
+          existing.stock_tobago1 += stockVal;
+
+        existing.stock_global =
+          existing.stock_bettica +
+          existing.stock_grupogen +
+          existing.stock_monteverde +
+          existing.stock_tobago1;
+      }
     }
+
+    console.log(`[ITEMS] Items combinados: ${combinedData.length}`);
+
+    await AgrItem.deleteMany({});
+    await AgrItem.insertMany(combinedData);
+    console.log("[ITEMS] Datos guardados en Mongo correctamente.");
+  } catch (err) {
+    console.error("[ITEMS] ERROR general:", err);
+    throw err;
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (e) {
+        console.error("[ITEMS] Error al cerrar browser:", e.message);
+      }
+    }
+    await mongoose.disconnect().catch(() => {});
+    isItemsRunning = false;
+    console.log("[ITEMS] Proceso terminado.");
   }
-
-  console.log(`[ITEMS] Items combinados: ${combinedData.length}`);
-
-  await AgrItem.deleteMany({});
-  await AgrItem.insertMany(combinedData);
-  console.log("[ITEMS] Datos guardados en Mongo correctamente.");
-
-  await browser.close();
-  await mongoose.disconnect();
-  console.log("[ITEMS] Proceso terminado.");
 }
 
 module.exports = { runItemsScraper };
