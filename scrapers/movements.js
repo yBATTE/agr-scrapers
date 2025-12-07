@@ -10,6 +10,12 @@ if (!AGR_EMAIL || !AGR_PASSWORD || !MONGO_URI) {
   process.exit(1);
 }
 
+// Path de Chromium
+const CHROME_EXECUTABLE_PATH =
+  process.env.PUPPETEER_EXECUTABLE_PATH ||
+  process.env.CHROME_PATH ||
+  "/usr/bin/chromium";
+
 // ==== Mongo: colecciones live ====
 // Cafés agregados (por tipo y entidad)
 const coffeeMovementSchema = new mongoose.Schema(
@@ -259,8 +265,17 @@ async function scrapeAllMovements(page, { startDate, endDate }) {
   return all;
 }
 
+// ==== LOCK para evitar ejecuciones concurrentes ====
+let isMovementsRunning = false;
+
 // ==== Proceso principal movimientos ====
 async function runMovementsScraper() {
+  if (isMovementsRunning) {
+    console.log("[MOV] Ya hay una ejecución en curso, se cancela esta.");
+    return;
+  }
+  isMovementsRunning = true;
+
   console.log("[MOV] Conectando a Mongo…");
   await mongoose.connect(MONGO_URI);
 
@@ -270,6 +285,8 @@ async function runMovementsScraper() {
   let browser;
 
   try {
+    console.log("[MOV] Usando Chromium en:", CHROME_EXECUTABLE_PATH);
+
     const meta = await ScraperMeta.findById("scraper-meta").lean();
     const previousMonthInMeta = meta?.currentMonth || null;
 
@@ -322,23 +339,29 @@ async function runMovementsScraper() {
       { upsert: true }
     );
 
-    browser = await puppeteer.launch({
-      headless: "new",
+    const launchOptions = {
+      headless: true, // en VPS mejor que "new"
+      executablePath: CHROME_EXECUTABLE_PATH,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--disable-extensions",
+        "--disable-software-rasterizer",
+        "--disable-background-networking",
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
+        "--no-zygote",
+        "--single-process",
+        "--renderer-process-limit=1",
       ],
-      executablePath:
-        process.env.PUPPETEER_EXECUTABLE_PATH ||
-        process.env.CHROME_PATH ||
-        undefined,
       protocolTimeout: 240000,
-    });
+    };
+
+    console.log("[MOV] Lanzando Puppeteer...");
+    browser = await puppeteer.launch(launchOptions);
 
     const page = await browser.newPage();
     page.setDefaultTimeout(240000);
@@ -395,7 +418,8 @@ async function runMovementsScraper() {
       if (entUp.includes("MONTEVERDE")) label = "Monteverde";
       else if (entUp.includes("TOBAGO")) label = "Tobago SA 1";
       else if (entUp.includes("BETTICA")) label = "Bettica SA";
-      else if (entUp.includes("GRUPO") && entUp.includes("GEN")) label = "Grupo GEN";
+      else if (entUp.includes("GRUPO") && entUp.includes("GEN"))
+        label = "Grupo GEN";
 
       byEnt[label] += m.cantidad || 0;
     }
@@ -476,6 +500,9 @@ async function runMovementsScraper() {
     } else {
       console.log("[MOV] No hay otros ítems para upsert en movements.");
     }
+  } catch (err) {
+    console.error("[MOV] ERROR general:", err);
+    throw err;
   } finally {
     if (browser) {
       try {
@@ -485,6 +512,7 @@ async function runMovementsScraper() {
       }
     }
     await mongoose.disconnect().catch(() => {});
+    isMovementsRunning = false;
     console.log("[MOV] Proceso completado.");
   }
 }
