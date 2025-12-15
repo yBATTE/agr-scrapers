@@ -39,8 +39,39 @@ const productSchema = new mongoose.Schema(
 
 const AgrItem = mongoose.model("AgrItem", productSchema);
 
-// ================== HELPERS DE SCRAPING ==================
+// ================== HELPERS ==================
+const norm = (s = "") =>
+  s
+    .toString()
+    .normalize("NFKC")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase();
 
+const parseStock = (s = "") => {
+  // "1.234" -> 1234, "1,234" -> 1234
+  const cleaned = s.toString().replace(/\./g, "").replace(/,/g, "").trim();
+  const n = parseInt(cleaned, 10);
+  return Number.isFinite(n) ? n : 0;
+};
+
+async function gotoWithRetries(page, url, { retries = 2, ...opts } = {}) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      await page.goto(url, opts);
+      return;
+    } catch (e) {
+      lastErr = e;
+      console.log(`[ITEMS] goto retry ${i + 1}/${retries + 1} ->`, e.message);
+      await page.waitForTimeout(1500);
+    }
+  }
+  throw lastErr;
+}
+
+// ================== SCRAPING ==================
 async function extractAllProducts(page) {
   const baseUrl =
     "https://adm.agrcloud.com.ar/filtered/stocks/2?orderBy=description-asc";
@@ -50,7 +81,15 @@ async function extractAllProducts(page) {
 
   const allProducts = [];
 
-  await page.goto(buildUrl(1), { waitUntil: "networkidle2" });
+  await gotoWithRetries(page, buildUrl(1), {
+    waitUntil: "domcontentloaded",
+    timeout: 240000,
+  });
+
+  // Intentar esperar tabla (sin romper si tarda)
+  try {
+    await page.waitForSelector("tbody tr", { timeout: 15000 });
+  } catch {}
 
   const totalPages = await page.evaluate(() => {
     const buttons = document.querySelectorAll("ul.pagination button.page");
@@ -66,7 +105,17 @@ async function extractAllProducts(page) {
 
   for (let pageNumber = 1; pageNumber <= totalPages; pageNumber++) {
     console.log(`[ITEMS] Extrayendo productos de la página ${pageNumber}...`);
-    await page.goto(buildUrl(pageNumber), { waitUntil: "networkidle2" });
+    await gotoWithRetries(page, buildUrl(pageNumber), {
+      waitUntil: "domcontentloaded",
+      timeout: 240000,
+    });
+
+    try {
+      await page.waitForSelector("tbody tr", { timeout: 15000 });
+    } catch {
+      console.log("[ITEMS]   → No se encontraron filas en esta página.");
+      continue;
+    }
 
     const itemsOnPage = await page.evaluate(() => {
       const rows = document.querySelectorAll("tbody tr.news-item");
@@ -110,7 +159,14 @@ async function extractAllRewards(page) {
 
   const allRewards = [];
 
-  await page.goto(buildUrl(1), { waitUntil: "networkidle2" });
+  await gotoWithRetries(page, buildUrl(1), {
+    waitUntil: "domcontentloaded",
+    timeout: 240000,
+  });
+
+  try {
+    await page.waitForSelector("tbody tr", { timeout: 15000 });
+  } catch {}
 
   const totalPages = await page.evaluate(() => {
     const buttons = document.querySelectorAll("ul.pagination button.page");
@@ -126,12 +182,16 @@ async function extractAllRewards(page) {
 
   for (let pageNumber = 1; pageNumber <= totalPages; pageNumber++) {
     console.log(`[ITEMS] Extrayendo recompensas de la página ${pageNumber}...`);
-    await page.goto(buildUrl(pageNumber), { waitUntil: "networkidle2" });
+    await gotoWithRetries(page, buildUrl(pageNumber), {
+      waitUntil: "domcontentloaded",
+      timeout: 240000,
+    });
 
     try {
-      await page.waitForSelector("tbody tr", { timeout: 10000 });
+      await page.waitForSelector("tbody tr", { timeout: 15000 });
     } catch {
       console.log("[ITEMS]   → No se encontraron filas en esta página.");
+      continue;
     }
 
     const rewardsOnPage = await page.evaluate(() => {
@@ -148,9 +208,7 @@ async function extractAllRewards(page) {
           row.querySelector("td:nth-child(2) p") ||
           row.querySelector("p");
 
-        if (descP) {
-          description = descP.innerText.trim();
-        }
+        if (descP) description = descP.innerText.trim();
         if (!description) return;
 
         const category = tds[3]?.innerText.trim() || "";
@@ -175,7 +233,6 @@ async function extractAllRewards(page) {
 }
 
 // ================== MAIN ==================
-
 let isItemsRunning = false;
 
 async function runItemsScraper() {
@@ -185,14 +242,19 @@ async function runItemsScraper() {
   }
   isItemsRunning = true;
 
-  console.log("[ITEMS] Conectando a Mongo...");
-  await mongoose.connect(mongoUri);
-
   let browser;
+  let mongoConnected = false;
 
   try {
+    console.log("[ITEMS] Conectando a Mongo...");
+    await mongoose.connect(mongoUri, {
+      serverSelectionTimeoutMS: 30000,
+      socketTimeoutMS: 240000,
+    });
+    mongoConnected = true;
+
     const launchOptions = {
-      headless: true, // más compatible que "new" en VPS
+      headless: true,
       executablePath: CHROME_EXECUTABLE_PATH,
       args: [
         "--no-sandbox",
@@ -206,6 +268,7 @@ async function runItemsScraper() {
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
         "--no-zygote",
+        // Si volviera a fallar Chromium, probá sacarlo:
         "--single-process",
         "--renderer-process-limit=1",
       ],
@@ -215,7 +278,6 @@ async function runItemsScraper() {
     console.log(
       `[ITEMS] Lanzando Puppeteer usando executablePath=${CHROME_EXECUTABLE_PATH}`
     );
-    console.log("[ITEMS] Lanzando Puppeteer...");
     browser = await puppeteer.launch(launchOptions);
 
     const page = await browser.newPage();
@@ -224,16 +286,17 @@ async function runItemsScraper() {
 
     await page.setRequestInterception(true);
     page.on("request", (request) => {
-      if (request.resourceType() === "image") {
-        request.abort();
-      } else {
-        request.continue();
-      }
+      if (request.resourceType() === "image") request.abort();
+      else request.continue();
     });
 
-    await page.goto("https://adm.agrcloud.com.ar", {
-      waitUntil: "networkidle2",
+    await gotoWithRetries(page, "https://adm.agrcloud.com.ar", {
+      waitUntil: "domcontentloaded",
       timeout: 240000,
+    });
+
+    await page.waitForSelector("input#Username.form-control.form-icon-input", {
+      timeout: 30000,
     });
 
     await page.type("input#Username.form-control.form-icon-input", email);
@@ -241,8 +304,14 @@ async function runItemsScraper() {
 
     await Promise.all([
       page.click("button[type='submit']"),
-      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 240000 }),
+      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 240000 }),
     ]);
+
+    // Si sigue el login form, el login falló
+    const stillLogin = await page.$(
+      "input#Username.form-control.form-icon-input"
+    );
+    if (stillLogin) throw new Error("Login falló (sigue el formulario).");
 
     console.log("[ITEMS] Login OK, arrancamos scraping...");
 
@@ -253,59 +322,52 @@ async function runItemsScraper() {
       `[ITEMS] Productos totales: ${products.length}, recompensas totales: ${rewards.length}`
     );
 
-    const combinedData = [];
+    // Map por description normalizada (evita O(n^2) y problemas por espacios)
+    const rewardMap = new Map(rewards.map((r) => [norm(r.description), r]));
+    const stockMap = new Map();
 
-    for (const product of products) {
-      const stockVal = parseInt(product.stock, 10) || 0;
-      let existing = combinedData.find(
-        (item) => item.description === product.description
-      );
+    for (const p of products) {
+      const key = norm(p.description);
+      const stockVal = parseStock(p.stock);
 
-      if (!existing) {
-        const base = {
-          description: product.description,
-          category: product.category,
-          stock_bettica:
-            product.location === "DEPOSITO BETTICA" ? stockVal : 0,
-          stock_grupogen:
-            product.location === "DEPOSITO GRUPO GEN" ? stockVal : 0,
-          stock_monteverde:
-            product.location === "DEPOSITO MONTEVERDE" ? stockVal : 0,
-          stock_tobago1:
-            product.location === "DEPOSITO TOBAGO 1" ? stockVal : 0,
-        };
-        base.stock_global =
-          base.stock_bettica +
-          base.stock_grupogen +
-          base.stock_monteverde +
-          base.stock_tobago1;
-
-        const reward =
-          rewards.find((r) => r.description === product.description) || {};
-
-        combinedData.push({ ...base, ...reward });
-      } else {
-        if (product.location === "DEPOSITO BETTICA")
-          existing.stock_bettica += stockVal;
-        if (product.location === "DEPOSITO GRUPO GEN")
-          existing.stock_grupogen += stockVal;
-        if (product.location === "DEPOSITO MONTEVERDE")
-          existing.stock_monteverde += stockVal;
-        if (product.location === "DEPOSITO TOBAGO 1")
-          existing.stock_tobago1 += stockVal;
-
-        existing.stock_global =
-          existing.stock_bettica +
-          existing.stock_grupogen +
-          existing.stock_monteverde +
-          existing.stock_tobago1;
+      if (!stockMap.has(key)) {
+        stockMap.set(key, {
+          description: p.description,
+          category: p.category,
+          stock_bettica: 0,
+          stock_grupogen: 0,
+          stock_monteverde: 0,
+          stock_tobago1: 0,
+          stock_global: 0,
+        });
       }
+
+      const item = stockMap.get(key);
+
+      if (p.location === "DEPOSITO BETTICA") item.stock_bettica += stockVal;
+      if (p.location === "DEPOSITO GRUPO GEN") item.stock_grupogen += stockVal;
+      if (p.location === "DEPOSITO MONTEVERDE")
+        item.stock_monteverde += stockVal;
+      if (p.location === "DEPOSITO TOBAGO 1") item.stock_tobago1 += stockVal;
+
+      item.stock_global =
+        item.stock_bettica +
+        item.stock_grupogen +
+        item.stock_monteverde +
+        item.stock_tobago1;
     }
+
+    const combinedData = Array.from(stockMap.entries()).map(([key, base]) => {
+      const reward = rewardMap.get(key) || {};
+      return { ...base, ...reward, scrapedAt: new Date() };
+    });
 
     console.log(`[ITEMS] Items combinados: ${combinedData.length}`);
 
     await AgrItem.deleteMany({});
-    await AgrItem.insertMany(combinedData);
+    if (combinedData.length) {
+      await AgrItem.insertMany(combinedData, { ordered: false });
+    }
     console.log("[ITEMS] Datos guardados en Mongo correctamente.");
   } catch (err) {
     console.error("[ITEMS] ERROR general:", err);
@@ -318,7 +380,7 @@ async function runItemsScraper() {
         console.error("[ITEMS] Error al cerrar browser:", e.message);
       }
     }
-    await mongoose.disconnect().catch(() => {});
+    if (mongoConnected) await mongoose.disconnect().catch(() => {});
     isItemsRunning = false;
     console.log("[ITEMS] Proceso terminado.");
   }
