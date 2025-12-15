@@ -51,15 +51,15 @@ app.listen(PORT, "0.0.0.0", () => {
   );
 });
 
+// Logs útiles si algo rompe “silencioso”
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] UnhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] UncaughtException:", err);
+});
+
 // ==== CRON ====
-
-/**
- * Ajustá los horarios como quieras.
- * Ejemplo:
- *  - Movements cada 30 minutos
- *  - Items una vez por hora al minuto 5
- */
-
 // Movimientos cada 30 minutos
 cron.schedule("*/30 * * * *", async () => {
   console.log("[CRON] Movements (cada 30 min)...");
