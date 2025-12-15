@@ -184,15 +184,46 @@ function parseAgrDate(fechaStr = "") {
   return new Date(yyyy, mm - 1, dd, HH, MM, SS);
 }
 
+// ==== Helpers ====
+async function gotoWithRetries(page, url, { retries = 2, ...opts } = {}) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      await page.goto(url, opts);
+      return;
+    } catch (e) {
+      lastErr = e;
+      console.log(`[MOV] goto retry ${i + 1}/${retries + 1} ->`, e.message);
+      await page.waitForTimeout(1500);
+    }
+  }
+  throw lastErr;
+}
+
 // ==== Login ====
 async function login(page) {
-  await page.goto("https://adm.agrcloud.com.ar", { waitUntil: "networkidle2" });
+  await gotoWithRetries(page, "https://adm.agrcloud.com.ar", {
+    waitUntil: "domcontentloaded",
+    timeout: 240000,
+  });
+
+  await page.waitForSelector("input#Username.form-control.form-icon-input", {
+    timeout: 30000,
+  });
+
   await page.type("input#Username.form-control.form-icon-input", AGR_EMAIL);
   await page.type("input#Password.form-control.form-icon-input", AGR_PASSWORD);
+
   await Promise.all([
     page.click("button[type='submit']"),
-    page.waitForNavigation({ waitUntil: "networkidle2" }),
+    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 240000 }),
   ]);
+
+  const stillLogin = await page.$(
+    "input#Username.form-control.form-icon-input"
+  );
+  if (stillLogin) throw new Error("Login falló (sigue el formulario).");
+
   console.log("[MOV] Login OK");
 }
 
@@ -210,8 +241,11 @@ async function scrapeAllMovements(page, { startDate, endDate }) {
       endDate
     )}&orderBy=date-desc&page=${pageNum}&pageSize=${pageSize}`;
 
-    console.log(`[MOV] Cargando página ${pageNum} → ${url}`);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 240000 });
+    console.log(`[MOV] Cargando página ${pageNum}`);
+    await gotoWithRetries(page, url, {
+      waitUntil: "domcontentloaded",
+      timeout: 240000,
+    });
 
     try {
       await page.waitForSelector("tbody tr", { timeout: 15000 });
@@ -241,7 +275,10 @@ async function scrapeAllMovements(page, { startDate, endDate }) {
         };
 
         const cantidadText = pick(8);
-        const cantidadNum = parseInt(cantidadText.replace(/\./g, ""), 10) || 0;
+        const cantidadNum = parseInt(
+          cantidadText.replace(/\./g, "").replace(/,/g, ""),
+          10
+        ) || 0;
 
         return {
           fecha: pick(1),
@@ -276,20 +313,26 @@ async function runMovementsScraper() {
   }
   isMovementsRunning = true;
 
-  console.log("[MOV] Conectando a Mongo…");
-  await mongoose.connect(MONGO_URI);
+  let browser;
+  let mongoConnected = false;
 
   const now = new Date();
   const monthKey = currentMonthKey(now);
 
-  let browser;
-
   try {
+    console.log("[MOV] Conectando a Mongo…");
+    await mongoose.connect(MONGO_URI, {
+      serverSelectionTimeoutMS: 30000,
+      socketTimeoutMS: 240000,
+    });
+    mongoConnected = true;
+
     console.log("[MOV] Usando Chromium en:", CHROME_EXECUTABLE_PATH);
 
     const meta = await ScraperMeta.findById("scraper-meta").lean();
     const previousMonthInMeta = meta?.currentMonth || null;
 
+    // Si cambió el mes: archivar live del mes anterior (evitando duplicados)
     if (previousMonthInMeta && previousMonthInMeta !== monthKey) {
       console.log(
         `[MOV] Mes cambió de ${previousMonthInMeta} a ${monthKey}. Archivando datos anteriores…`
@@ -304,15 +347,22 @@ async function runMovementsScraper() {
         `[MOV] Live a archivar: CoffeeMovement=${coffeeLive.length}, OtherItem=${otherLive.length}`
       );
 
+      // Evitar duplicados: limpiar el histórico del mes anterior antes de insertar
+      await Promise.all([
+        CoffeeMovementHistory.deleteMany({ periodMonth: previousMonthInMeta }),
+        OtherItemHistory.deleteMany({ periodMonth: previousMonthInMeta }),
+      ]);
+
       if (coffeeLive.length) {
         const coffeeHistoryDocs = coffeeLive.map((doc) => ({
           ...doc,
           periodMonth: previousMonthInMeta,
         }));
-
-        await CoffeeMovementHistory.insertMany(coffeeHistoryDocs);
+        await CoffeeMovementHistory.insertMany(coffeeHistoryDocs, {
+          ordered: false,
+        });
         console.log(
-          `[MOV] Archivados ${coffeeLive.length} docs de CoffeeMovement → CoffeeMovementHistory (${previousMonthInMeta})`
+          `[MOV] Archivados ${coffeeLive.length} docs → CoffeeMovementHistory (${previousMonthInMeta})`
         );
       }
 
@@ -321,26 +371,23 @@ async function runMovementsScraper() {
           ...doc,
           periodMonth: previousMonthInMeta,
         }));
-
-        await OtherItemHistory.insertMany(otherHistoryDocs);
+        await OtherItemHistory.insertMany(otherHistoryDocs, { ordered: false });
         console.log(
-          `[MOV] Archivados ${otherLive.length} docs de OtherItem → OtherItemHistory (${previousMonthInMeta})`
+          `[MOV] Archivados ${otherLive.length} docs → OtherItemHistory (${previousMonthInMeta})`
         );
       }
     }
 
-    await CoffeeMovement.deleteMany({});
-    await OtherItem.deleteMany({});
-    console.log("[MOV] Colecciones live limpiadas.");
-
+    // Guardar meta del mes actual (upsert)
     await ScraperMeta.findByIdAndUpdate(
       "scraper-meta",
       { currentMonth: monthKey },
       { upsert: true }
     );
 
+    // Lanzar browser
     const launchOptions = {
-      headless: true, // en VPS mejor que "new"
+      headless: true,
       executablePath: CHROME_EXECUTABLE_PATH,
       args: [
         "--no-sandbox",
@@ -354,6 +401,7 @@ async function runMovementsScraper() {
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
         "--no-zygote",
+        // Si Chromium vuelve a romper, probá sacarlo:
         "--single-process",
         "--renderer-process-limit=1",
       ],
@@ -411,6 +459,7 @@ async function runMovementsScraper() {
         for (const ent of ENTIDADES) initialCounts[ent] = 0;
         buckets.set(tipoCafeOriginal, initialCounts);
       }
+
       const byEnt = buckets.get(tipoCafeOriginal);
 
       const entUp = norm(m.entidad);
@@ -424,6 +473,8 @@ async function runMovementsScraper() {
       byEnt[label] += m.cantidad || 0;
     }
 
+    const nowDate = new Date();
+
     const coffeeDocs = Array.from(buckets.entries()).map(
       ([tipoCafe, counts]) => ({
         tipoCafe,
@@ -431,31 +482,29 @@ async function runMovementsScraper() {
           entidad: ent,
           cantidad: counts[ent] || 0,
         })),
-        scrapedAt: new Date(),
+        scrapedAt: nowDate,
       })
     );
 
-    if (coffeeDocs.length) {
-      await CoffeeMovement.insertMany(coffeeDocs);
-    }
+    // === Otros ítems (NO cafés) live ===
+    const otherItems = movimientos.filter((m) => !isCafe(m.recompensa));
+
+    // ✅ IMPORTANTE: recién acá reemplazamos colecciones live (evita quedarte vacío si falla antes)
+    await CoffeeMovement.deleteMany({});
+    await OtherItem.deleteMany({});
+
+    if (coffeeDocs.length) await CoffeeMovement.insertMany(coffeeDocs);
     console.log(`[MOV] Insertados en coffeemovements: ${coffeeDocs.length}`);
 
-    // === Otros ítems (NO cafés) ===
-    const otherItems = movimientos.filter((m) => !isCafe(m.recompensa));
-    const nowDate = new Date();
-    const currentPeriod = monthKey;
-
     if (otherItems.length) {
-      const docs = otherItems.map((item) => ({
-        ...item,
-        scrapedAt: nowDate,
-      }));
-      await OtherItem.insertMany(docs);
+      const docs = otherItems.map((item) => ({ ...item, scrapedAt: nowDate }));
+      await OtherItem.insertMany(docs, { ordered: false });
     }
     console.log(`[MOV] Insertados en otheritems: ${otherItems.length}`);
 
-    if (otherItems.length) {
-      const bulkOps = otherItems.map((m) => {
+    // ✅ Upsert global movements (TODOS: cafés + no cafés) con flag isCafeCombo
+    if (movimientos.length) {
+      const bulkOps = movimientos.map((m) => {
         const rowId = [
           m.fecha,
           m.entidad,
@@ -483,8 +532,8 @@ async function runMovementsScraper() {
                 depositoOrigen: m.depositoOrigen,
                 depositoDestino: m.depositoDestino,
                 cantidad: m.cantidad,
-                isCafeCombo: false,
-                periodMonth: currentPeriod,
+                isCafeCombo: isCafe(m.recompensa),
+                periodMonth: monthKey,
                 scrapedAt: nowDate,
               },
             },
@@ -495,10 +544,10 @@ async function runMovementsScraper() {
 
       const result = await Movement.bulkWrite(bulkOps, { ordered: false });
       console.log(
-        `[MOV] Movements upsertados: insertados=${result.upsertedCount}, modificados=${result.modifiedCount}`
+        `[MOV] Movements upsertados: upserted=${result.upsertedCount}, modified=${result.modifiedCount}`
       );
     } else {
-      console.log("[MOV] No hay otros ítems para upsert en movements.");
+      console.log("[MOV] No hay movimientos para upsert en movements.");
     }
   } catch (err) {
     console.error("[MOV] ERROR general:", err);
@@ -511,7 +560,7 @@ async function runMovementsScraper() {
         console.error("[MOV] Error al cerrar browser:", e.message);
       }
     }
-    await mongoose.disconnect().catch(() => {});
+    if (mongoConnected) await mongoose.disconnect().catch(() => {});
     isMovementsRunning = false;
     console.log("[MOV] Proceso completado.");
   }
